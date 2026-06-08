@@ -30,9 +30,9 @@ export async function scoreProspect(input: ScoringInput): Promise<ScoringResult>
   let score = 0;
   const signals: string[] = [];
 
-  // Personal email → low score
+  // Personal email — still a potential user, just lower baseline
   if (isPersonalDomain(domain)) {
-    return { icpScore: 5, signals: ['personal_email'] };
+    return { icpScore: 25, signals: ['personal_email'] };
   }
 
   // Business email baseline
