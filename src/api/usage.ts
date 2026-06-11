@@ -25,7 +25,7 @@ export function createUsageRouter(): Router {
         return;
       }
 
-      const { vendor_id, email, domain, tool_name, outcome, agent_session_id, latency_ms, tool_arguments } = req.body;
+      const { vendor_id, email, domain, tool_name, outcome, agent_session_id, agent_client_name, ip_address, tool_arguments } = req.body;
 
       if (!vendor_id || !email || !tool_name || !outcome) {
         res.status(400).json({ error: 'vendor_id, email, tool_name, and outcome are required' });
@@ -40,7 +40,8 @@ export function createUsageRouter(): Router {
         tool_name,
         outcome,
         agent_session_id,
-        latency_ms,
+        agent_client_name,
+        ip_address,
         tool_arguments,
       });
 

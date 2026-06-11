@@ -12,7 +12,8 @@ export interface UsageEvent {
   tool_name: string;
   outcome: 'success' | 'failure' | 'quota_exceeded' | 'scope_denied';
   agent_session_id?: string;
-  latency_ms?: number;
+  agent_client_name?: string;
+  ip_address?: string;
   tool_arguments?: Record<string, unknown>;
   created_at: string;
 }
