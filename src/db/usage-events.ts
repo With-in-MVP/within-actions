@@ -13,6 +13,7 @@ export interface UsageEvent {
   outcome: 'success' | 'failure' | 'quota_exceeded' | 'scope_denied';
   agent_session_id?: string;
   latency_ms?: number;
+  tool_arguments?: Record<string, unknown>;
   created_at: string;
 }
 

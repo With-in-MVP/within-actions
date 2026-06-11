@@ -25,7 +25,7 @@ export function createUsageRouter(): Router {
         return;
       }
 
-      const { vendor_id, email, domain, tool_name, outcome, agent_session_id, latency_ms } = req.body;
+      const { vendor_id, email, domain, tool_name, outcome, agent_session_id, latency_ms, tool_arguments } = req.body;
 
       if (!vendor_id || !email || !tool_name || !outcome) {
         res.status(400).json({ error: 'vendor_id, email, tool_name, and outcome are required' });
@@ -41,6 +41,7 @@ export function createUsageRouter(): Router {
         outcome,
         agent_session_id,
         latency_ms,
+        tool_arguments,
       });
 
       // Only success increments quota
