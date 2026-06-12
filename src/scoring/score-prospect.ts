@@ -1,12 +1,16 @@
 /**
  * ICP Scoring — uses Claude to produce a 0-100 score from enrichment data.
  *
- * For now this is a placeholder that uses heuristics. The Claude-based scoring
- * agent will be wired in once the basic flow works end-to-end.
+ * Personal emails short-circuit to score 25 (tier 1).
+ * Business emails get enriched (domain → company info via Claude) then scored
+ * by Claude against the vendor's ideal customer profile.
  */
 
-import { getCachedEnrichment } from '../db/enrichment-cache.js';
+import Anthropic from '@anthropic-ai/sdk';
 import { isPersonalDomain } from '../enrichment/domain-lists.js';
+import { enrichDomain } from '../enrichment/enrich-domain.js';
+
+const anthropic = new Anthropic();
 
 export interface ScoringInput {
   email: string;
@@ -22,57 +26,92 @@ export interface ScoringResult {
 /**
  * Score a prospect. Returns 0-100 ICP score.
  *
- * Current implementation: heuristic scoring based on enrichment data.
- * Future: Claude-based scoring agent with vendor-specific ICP criteria.
+ * Pipeline: personal email check → domain enrichment → Claude scoring.
  */
 export async function scoreProspect(input: ScoringInput): Promise<ScoringResult> {
-  const { email, domain } = input;
-  let score = 0;
-  const signals: string[] = [];
+  const { domain, vendorId } = input;
 
-  // Personal email — still a potential user, just lower baseline
+  // Personal email — skip enrichment, floor score
   if (isPersonalDomain(domain)) {
     return { icpScore: 25, signals: ['personal_email'] };
   }
 
-  // Business email baseline
-  score += 25;
-  signals.push('business_email');
+  // Enrich the domain (cached, 7-day TTL)
+  const enrichment = await enrichDomain(domain);
 
-  // Check enrichment cache for firmographic signals
-  const enrichment = await getCachedEnrichment(domain);
-
-  if (enrichment) {
-    signals.push('enriched');
-
-    // Company size signal
-    if (enrichment.employee_range) {
-      const range = enrichment.employee_range;
-      if (['51-200', '201-500', '501-1000'].includes(range)) {
-        score += 20;
-        signals.push('mid_market');
-      } else if (['1001-5000', '5001-10000', '10000+'].includes(range)) {
-        score += 30;
-        signals.push('enterprise');
-      } else {
-        score += 10;
-        signals.push('smb');
-      }
-    }
-
-    // Industry signal (placeholder — vendor-specific ICP criteria will refine this)
-    if (enrichment.industry) {
-      score += 15;
-      signals.push('known_industry');
-    }
-  } else {
-    // No enrichment data — moderate score for business email
-    score += 10;
-    signals.push('no_enrichment');
+  if (!enrichment) {
+    // Unknown domain — business email but no company info
+    return { icpScore: 30, signals: ['business_email', 'unknown_domain'] };
   }
 
-  // Clamp to 0-100
-  const icpScore = Math.max(0, Math.min(100, score));
+  // Score with Claude
+  try {
+    const companyProfile = [
+      `Company: ${enrichment.company_name}`,
+      `Domain: ${domain}`,
+      `Industry: ${enrichment.industry}`,
+      `Employees: ${enrichment.employee_range}`,
+      enrichment.revenue_range ? `Revenue: ${enrichment.revenue_range}` : null,
+      enrichment.location ? `Location: ${enrichment.location}` : null,
+    ].filter(Boolean).join('\n');
 
-  return { icpScore, signals };
+    // TODO: load vendor-specific ICP criteria from database
+    const vendorContext = getVendorContext(vendorId);
+
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 200,
+      messages: [
+        {
+          role: 'user',
+          content: `You are scoring a prospect for "${vendorContext.name}".
+
+${vendorContext.description}
+
+Ideal customers: ${vendorContext.idealCustomer}
+
+Prospect's company:
+${companyProfile}
+
+Score this prospect 0-100 on how well they fit the vendor's ideal customer profile. Consider industry relevance, company size, and likely use case.
+
+Return ONLY a JSON object:
+{"score": number, "reasoning": "one sentence"}`,
+        },
+      ],
+    });
+
+    const text = response.content[0].type === 'text' ? response.content[0].text : '';
+    const parsed = JSON.parse(text);
+    const icpScore = Math.max(0, Math.min(100, parsed.score));
+
+    return {
+      icpScore,
+      signals: ['business_email', 'enriched', 'claude_scored', parsed.reasoning],
+    };
+  } catch (err) {
+    console.error(`[scoring] Claude scoring failed for ${domain}:`, err);
+    // Fall back to basic enrichment-based score
+    return { icpScore: 35, signals: ['business_email', 'enriched', 'scoring_fallback'] };
+  }
+}
+
+/**
+ * Vendor context for scoring prompts.
+ * TODO: move to database so vendors can configure their own ICP criteria.
+ */
+function getVendorContext(vendorId: string): { name: string; description: string; idealCustomer: string } {
+  const vendors: Record<string, { name: string; description: string; idealCustomer: string }> = {
+    'test-vendor-real-estate': {
+      name: 'Real Estate MCP',
+      description: 'A property data tool that provides property search, lookups, and market analytics for real estate professionals.',
+      idealCustomer: 'Real estate brokerages, property management firms, commercial real estate companies, real estate tech platforms, and investment firms.',
+    },
+  };
+
+  return vendors[vendorId] ?? {
+    name: vendorId,
+    description: 'A software tool.',
+    idealCustomer: 'Businesses that would benefit from this tool.',
+  };
 }
