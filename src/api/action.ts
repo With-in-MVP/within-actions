@@ -53,7 +53,7 @@ export function createActionRouter(): Router {
       }
 
       // Score the prospect
-      const { icpScore } = await scoreProspect({ email, domain, vendorId: vendor_id });
+      const { icpScore, signals } = await scoreProspect({ email, domain, vendorId: vendor_id });
       const { tier, scopes, quotaLimit } = scoreToTier(icpScore);
 
       // Persist scoring result
@@ -63,6 +63,8 @@ export function createActionRouter(): Router {
         icp_score: icpScore,
         scopes,
         scored_at: new Date().toISOString(),
+        enrichment_status: signals.includes('enriched') ? 'enriched' : signals.includes('unknown_domain') ? 'unknown' : 'skipped',
+        scoring_signals: signals,
       });
 
       // Write/update the entitlement ledger row

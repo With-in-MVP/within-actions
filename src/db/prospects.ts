@@ -15,6 +15,7 @@ export interface ProspectIdentity {
   scopes: string[];
   scored_at: string;
   enrichment_status?: string;
+  scoring_signals?: string[];
   created_at: string;
 }
 
