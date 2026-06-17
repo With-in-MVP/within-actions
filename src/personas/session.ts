@@ -1,26 +1,26 @@
 /**
- * Run ONE persona session end-to-end against the LIVE stack:
- *   create user (real domain) -> ROPG -> read tier/quota -> Claude drives the 3
- *   MCP tools as the archetype -> stop on quota / disengagement / iteration cap
- *   -> summarize the usage_events it produced.
+ * Run ONE free-running persona session against the LIVE stack:
+ *   create user (real domain) -> ROPG -> read tier/quota -> the actor (Claude)
+ *   runs FREE as the generated character, deciding tool calls from its situation
+ *   -> stops on natural disengagement / quota / iteration guardrail -> summarize.
  *
- * Claude is the "behavior brain": given the archetype system prompt and the 3
- * tool schemas, it decides which tools to call and with what arguments. The MCP
- * server enforces scope/quota and logs every call — same path a real user hits.
+ * The actor's behavior EMERGES from the persona brief (see author.ts). Tier/quota
+ * come from real scoring of the domain. maxIterations is a pure cost guardrail,
+ * NOT a behavior shaper — a low-motivation character disengages well before it.
  */
 import Anthropic from '@anthropic-ai/sdk';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { createUser, ropgLogin, deleteUser } from './auth.js';
-import type { PersonaArchetype } from './personas.js';
+import type { GeneratedPersona } from './author.js';
 
 const MODEL = process.env.PERSONA_MODEL ?? 'claude-haiku-4-5';
 const VENDOR_ID = process.env.VENDOR_ID ?? 'test-vendor-real-estate';
+const MAX_ITERATIONS = 20; // cost guardrail only — emergent behavior usually stops sooner
 const TIER_QUOTA: Record<number, number> = { 0: 0, 1: 10, 2: 50, 3: 200, 4: 500 };
 const BLOCKED = /trial has ended|requires a higher plan tier|used all free/i;
 
-// Anthropic tool schemas — mirror the MCP server's 3 tools exactly.
 const TOOLS: Anthropic.Tool[] = [
   {
     name: 'search_properties',
@@ -54,14 +54,15 @@ const TOOLS: Anthropic.Tool[] = [
 ];
 
 export interface SessionSummary {
-  archetype: string;
+  domain: string;
+  latentIntent: number;
   email: string;
   tier: number;
   quotaLimit: number;
   toolCalls: number;
   iterations: number;
-  outcomes: Record<string, number>;
   stoppedBy: 'disengaged' | 'quota' | 'iteration_cap';
+  outcomes: Record<string, number>;
 }
 
 async function readQuota(
@@ -69,7 +70,6 @@ async function readQuota(
   email: string,
   fallbackTier: number,
 ): Promise<{ limit: number; used: number; remaining: number }> {
-  // The Post-Login Action writes the entitlement during login; allow brief lag.
   for (let i = 0; i < 4; i++) {
     const { data } = await supabase
       .from('entitlements')
@@ -98,36 +98,37 @@ function extractText(content: unknown): string {
 }
 
 export async function runPersonaSession(
-  archetype: PersonaArchetype,
+  persona: GeneratedPersona,
   mgmtToken: string,
   supabase: SupabaseClient,
   opts: { keep?: boolean } = {},
 ): Promise<SessionSummary> {
   const mcpUrl = process.env.MCP_URL!;
   const anthropic = new Anthropic();
+  const tag = persona.domain.split('.')[0];
 
   // 1. Provision + authenticate -------------------------------------------
-  const { userId, email, password } = await createUser(archetype.domain, mgmtToken);
+  const { userId, email, password } = await createUser(persona.domain, mgmtToken);
   const { accessToken, tier } = await ropgLogin(email, password);
-  console.log(`  [${archetype.key}] ${email} → tier ${tier} (${archetype.expectedFit})`);
+  console.log(`  [${tag}] ${email} → tier ${tier} (latent intent ${persona.latentIntent})`);
 
   // 2. Read the quota the scoring engine actually assigned -----------------
   const quota = await readQuota(supabase, email, tier);
-  console.log(`  [${archetype.key}] quota ${quota.remaining}/${quota.limit}`);
+  console.log(`  [${tag}] quota ${quota.remaining}/${quota.limit}`);
 
-  // 3. MCP client (bearer + per-persona User-Agent → agent_client_name) ----
+  // 3. MCP client (bearer + per-domain User-Agent → agent_client_name) -----
   const transport = new StreamableHTTPClientTransport(new URL(mcpUrl), {
     requestInit: {
-      headers: { authorization: `Bearer ${accessToken}`, 'user-agent': `persona-${archetype.key}` },
+      headers: { authorization: `Bearer ${accessToken}`, 'user-agent': `persona-${tag}` },
     },
   });
-  const client = new Client({ name: `persona-${archetype.key}`, version: '0.1.0' });
+  const client = new Client({ name: `persona-${tag}`, version: '0.1.0' });
   await client.connect(transport);
 
-  // 4. Agent loop — Claude drives the tools as the archetype --------------
-  const budget = Math.min(archetype.maxIterations, Math.max(1, quota.remaining));
+  // 4. Actor loop — Claude runs FREE as the character ---------------------
+  const budget = Math.min(MAX_ITERATIONS, Math.max(1, quota.remaining));
   const messages: Anthropic.MessageParam[] = [
-    { role: 'user', content: 'You have just opened the property-data tool. Begin exploring based on what you are looking for.' },
+    { role: 'user', content: 'You have just opened the property-data tool. Do whatever you would naturally do.' },
   ];
   let iterations = 0;
   let toolCalls = 0;
@@ -138,7 +139,7 @@ export async function runPersonaSession(
     const resp = await anthropic.messages.create({
       model: MODEL,
       max_tokens: 1024,
-      system: archetype.systemPrompt,
+      system: persona.systemPrompt,
       tools: TOOLS,
       messages,
     });
@@ -146,7 +147,7 @@ export async function runPersonaSession(
 
     const toolUses = resp.content.filter((b): b is Anthropic.ToolUseBlock => b.type === 'tool_use');
     if (resp.stop_reason !== 'tool_use' || toolUses.length === 0) {
-      stoppedBy = 'disengaged'; // persona decided it was done
+      stoppedBy = 'disengaged';
       break;
     }
 
@@ -156,7 +157,7 @@ export async function runPersonaSession(
       const result = await client.callTool({ name: tu.name, arguments: tu.input as Record<string, unknown> });
       toolCalls++;
       const text = extractText(result.content);
-      console.log(`  [${archetype.key}] call ${toolCalls}: ${tu.name}(${JSON.stringify(tu.input)})`);
+      console.log(`  [${tag}] call ${toolCalls}: ${tu.name}(${JSON.stringify(tu.input)})`);
       if (BLOCKED.test(text)) blocked = true;
       toolResults.push({ type: 'tool_result', tool_use_id: tu.id, content: text });
     }
@@ -168,38 +169,39 @@ export async function runPersonaSession(
     }
   }
   if (iterations >= budget && stoppedBy !== 'quota') {
-    stoppedBy = iterations >= archetype.maxIterations ? 'iteration_cap' : 'quota';
+    stoppedBy = iterations >= MAX_ITERATIONS ? 'iteration_cap' : 'quota';
   }
 
   await client.close();
 
-  // 5. Summarize the usage_events this persona actually produced ----------
-  await new Promise((r) => setTimeout(r, 1200)); // let final metering land
+  // 5. Summarize the usage_events this persona produced -------------------
+  await new Promise((r) => setTimeout(r, 1200));
   const { data: events } = await supabase
     .from('usage_events')
-    .select('tool_name, outcome')
+    .select('outcome')
     .eq('vendor_id', VENDOR_ID)
     .eq('email', email);
   const outcomes: Record<string, number> = {};
   for (const e of events ?? []) outcomes[e.outcome] = (outcomes[e.outcome] ?? 0) + 1;
 
-  // 6. Cleanup -----------------------------------------------------------
+  // 6. Cleanup ------------------------------------------------------------
   if (!opts.keep) {
     try {
       await deleteUser(userId, mgmtToken);
     } catch (e) {
-      console.log(`  [${archetype.key}] ⚠️ could not delete user: ${(e as Error).message}`);
+      console.log(`  [${tag}] ⚠️ could not delete user: ${(e as Error).message}`);
     }
   }
 
   return {
-    archetype: archetype.key,
+    domain: persona.domain,
+    latentIntent: persona.latentIntent,
     email,
     tier,
     quotaLimit: quota.limit,
     toolCalls,
     iterations,
-    outcomes,
     stoppedBy,
+    outcomes,
   };
 }

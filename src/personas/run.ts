@@ -1,17 +1,20 @@
 /**
- * Phase B runner — drive AI personas through the live stack and report the
- * usage_events they generate.
+ * Phase B runner (free-running personas).
  *
- *   npm run persona:run                       # one session per archetype
- *   npm run persona:run -- --archetype hot_lead
- *   npm run persona:run -- --repeat 2         # 2 sessions per archetype
- *   npm run persona:run -- --keep             # don't delete the Auth0 users
+ *   npm run persona:run                  # 4 personas
+ *   npm run persona:run -- --count 8     # 8 personas
+ *   npm run persona:run -- --keep        # don't delete the Auth0 users
  *
- * Sessions run sequentially (keeps cost legible and avoids hammering Auth0).
+ * Each persona = an independent draw of (domain, latent intent). The author turns
+ * the latent into a backstory; the actor runs free. Fit (tier/quota) comes from
+ * live scoring of the domain; engagement emerges from the character. The summary
+ * prints latent intent vs. tier vs. calls so you can eyeball whether behavior
+ * tracks the hidden intent (and the firmographic fit is independent of it).
  */
 import { createClient } from '@supabase/supabase-js';
 import { getMgmtToken } from './auth.js';
-import { PERSONA_ARCHETYPES, getArchetype } from './personas.js';
+import { sampleDomain, sampleIntent } from './personas.js';
+import { generatePersona } from './author.js';
 import { runPersonaSession, type SessionSummary } from './session.js';
 
 function arg(name: string): string | undefined {
@@ -23,43 +26,35 @@ function flag(name: string): boolean {
 }
 
 async function main() {
-  const which = arg('archetype');
-  const repeat = Number(arg('repeat') ?? 1);
+  const count = Number(arg('count') ?? 4);
   const keep = flag('keep');
-
-  const archetypes =
-    which && which !== 'all'
-      ? [getArchetype(which)].filter((a): a is NonNullable<typeof a> => {
-          if (!a) console.error(`Unknown archetype "${which}". Options: ${PERSONA_ARCHETYPES.map((x) => x.key).join(', ')}`);
-          return !!a;
-        })
-      : PERSONA_ARCHETYPES;
-  if (archetypes.length === 0) process.exit(1);
 
   const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
   const mgmtToken = await getMgmtToken();
 
-  console.log(`Running ${archetypes.length} archetype(s) × ${repeat} → ${archetypes.length * repeat} sessions\n`);
+  console.log(`Running ${count} free-running persona(s)\n`);
   const summaries: SessionSummary[] = [];
-  for (let r = 0; r < repeat; r++) {
-    for (const a of archetypes) {
-      try {
-        summaries.push(await runPersonaSession(a, mgmtToken, supabase, { keep }));
-      } catch (e) {
-        console.error(`  [${a.key}] 💥 ${(e as Error).message}`);
-      }
-      console.log('');
+  for (let i = 0; i < count; i++) {
+    const { domain } = sampleDomain();
+    const intent = sampleIntent();
+    try {
+      const persona = await generatePersona(domain, intent);
+      console.log(`— persona ${i + 1}: ${domain} (latent intent ${intent})`);
+      console.log(`  brief: ${persona.brief.replace(/\s+/g, ' ').slice(0, 160)}...`);
+      summaries.push(await runPersonaSession(persona, mgmtToken, supabase, { keep }));
+    } catch (e) {
+      console.error(`  [${domain}] 💥 ${(e as Error).message}`);
     }
+    console.log('');
   }
 
-  // Report ----------------------------------------------------------------
-  console.log('=== SESSION SUMMARY ===');
-  console.log('archetype      tier  quota  calls  stoppedBy        outcomes');
-  for (const s of summaries) {
-    const oc = Object.entries(s.outcomes).map(([k, v]) => `${k}:${v}`).join(' ') || '(none)';
+  // Report — sorted by latent intent so the fit/intent relationship is legible ---
+  console.log('=== SESSION SUMMARY (sorted by latent intent) ===');
+  console.log('domain                 latentIntent  tier  quota  calls  stoppedBy');
+  for (const s of [...summaries].sort((a, b) => a.latentIntent - b.latentIntent)) {
     console.log(
-      `${s.archetype.padEnd(14)} ${String(s.tier).padEnd(5)} ${String(s.quotaLimit).padEnd(6)} ` +
-        `${String(s.toolCalls).padEnd(6)} ${s.stoppedBy.padEnd(16)} ${oc}`,
+      `${s.domain.padEnd(22)} ${String(s.latentIntent).padEnd(13)} ${String(s.tier).padEnd(5)} ` +
+        `${String(s.quotaLimit).padEnd(6)} ${String(s.toolCalls).padEnd(6)} ${s.stoppedBy}`,
     );
   }
   const totalEvents = summaries.reduce((n, s) => n + Object.values(s.outcomes).reduce((a, b) => a + b, 0), 0);
