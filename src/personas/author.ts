@@ -55,8 +55,8 @@ export async function generatePersona(domain: string, latentIntent: number): Pro
   // Actor system = the character + a neutral tool framing (no behavior shaping).
   const systemPrompt =
     `${brief}\n\n` +
-    'You are using a property-data tool with three functions: search_properties, get_property, get_price_summary. ' +
-    'Act exactly as this person would in this situation: use the tools to do what they would actually do, and stop when they would naturally be finished. Prefer calling tools over narrating.';
+    'You are using a real-estate property-data tool. A set of functions is available to you (searching, comparing, analytics, saving listings, requesting showings, and more). ' +
+    'Act exactly as this person would in this situation: use whichever functions they would actually reach for, and stop when they would naturally be finished. Prefer calling tools over narrating.';
 
   return { domain, latentIntent, brief, systemPrompt };
 }

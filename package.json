@@ -9,7 +9,8 @@
     "start": "node dist/server.js",
     "simulate": "tsx --env-file=.env src/scripts/simulate-prospects.ts",
     "persona:probe": "tsx --env-file=.env src/personas/probe.ts",
-    "persona:run": "tsx --env-file=.env src/personas/run.ts"
+    "persona:run": "tsx --env-file=.env src/personas/run.ts",
+    "persona:scope-test": "tsx --env-file=.env src/personas/scope-test.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.90.0",

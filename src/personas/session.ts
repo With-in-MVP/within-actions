@@ -21,38 +21,6 @@ const MAX_ITERATIONS = 20; // cost guardrail only — emergent behavior usually 
 const TIER_QUOTA: Record<number, number> = { 0: 0, 1: 10, 2: 50, 3: 200, 4: 500 };
 const BLOCKED = /trial has ended|requires a higher plan tier|used all free/i;
 
-const TOOLS: Anthropic.Tool[] = [
-  {
-    name: 'search_properties',
-    description: 'Search properties by name, address, min/max square footage, and min/max price.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        name: { type: 'string' },
-        address: { type: 'string' },
-        square_footage_min: { type: 'number' },
-        square_footage_max: { type: 'number' },
-        price_min: { type: 'number' },
-        price_max: { type: 'number' },
-      },
-    },
-  },
-  {
-    name: 'get_property',
-    description: 'Look up a single property by name; returns address, square footage, and price.',
-    input_schema: {
-      type: 'object',
-      properties: { name: { type: 'string', description: 'property name' } },
-      required: ['name'],
-    },
-  },
-  {
-    name: 'get_price_summary',
-    description: 'Return a price summary across all properties.',
-    input_schema: { type: 'object', properties: {} },
-  },
-];
-
 export interface SessionSummary {
   domain: string;
   latentIntent: number;
@@ -65,28 +33,30 @@ export interface SessionSummary {
   outcomes: Record<string, number>;
 }
 
-async function readQuota(
+// Reads tier+quota from the LEDGER — the source of truth. The token's tier can be
+// floored to 1 if the Post-Login Action timed out, so we never display the token tier.
+async function readLedger(
   supabase: SupabaseClient,
   email: string,
-  fallbackTier: number,
-): Promise<{ limit: number; used: number; remaining: number }> {
+  tokenTier: number,
+): Promise<{ tier: number; limit: number; used: number; remaining: number }> {
   for (let i = 0; i < 4; i++) {
     const { data } = await supabase
       .from('entitlements')
-      .select('quota_limit, quota_used')
+      .select('tier, quota_limit, quota_used')
       .eq('vendor_id', VENDOR_ID)
       .eq('email', email)
       .limit(1);
     const row = data?.[0];
     if (row) {
-      const limit = row.quota_limit ?? TIER_QUOTA[fallbackTier] ?? 10;
+      const limit = row.quota_limit ?? TIER_QUOTA[tokenTier] ?? 10;
       const used = row.quota_used ?? 0;
-      return { limit, used, remaining: Math.max(0, limit - used) };
+      return { tier: row.tier ?? tokenTier, limit, used, remaining: Math.max(0, limit - used) };
     }
     await new Promise((r) => setTimeout(r, 600));
   }
-  const limit = TIER_QUOTA[fallbackTier] ?? 10;
-  return { limit, used: 0, remaining: limit };
+  const limit = TIER_QUOTA[tokenTier] ?? 10;
+  return { tier: tokenTier, limit, used: 0, remaining: limit };
 }
 
 function extractText(content: unknown): string {
@@ -109,11 +79,16 @@ export async function runPersonaSession(
 
   // 1. Provision + authenticate -------------------------------------------
   const { userId, email, password } = await createUser(persona.domain, mgmtToken);
-  const { accessToken, tier } = await ropgLogin(email, password);
-  console.log(`  [${tag}] ${email} → tier ${tier} (latent intent ${persona.latentIntent})`);
+  const { accessToken, tier: tokenTier } = await ropgLogin(email, password);
 
-  // 2. Read the quota the scoring engine actually assigned -----------------
-  const quota = await readQuota(supabase, email, tier);
+  // 2. Read tier+quota from the LEDGER (source of truth; token tier can be floored)
+  const quota = await readLedger(supabase, email, tokenTier);
+  const tier = quota.tier;
+  const floored = tokenTier !== quota.tier;
+  console.log(
+    `  [${tag}] ${email} → tier ${tier} (latent intent ${persona.latentIntent})` +
+      (floored ? ` ⚠️ token floored to ${tokenTier}` : ''),
+  );
   console.log(`  [${tag}] quota ${quota.remaining}/${quota.limit}`);
 
   // 3. MCP client (bearer + per-domain User-Agent → agent_client_name) -----
@@ -124,6 +99,15 @@ export async function runPersonaSession(
   });
   const client = new Client({ name: `persona-${tag}`, version: '0.1.0' });
   await client.connect(transport);
+
+  // Discover the vendor's tools dynamically — the actor uses whatever the server
+  // exposes, so adding vendor tools needs no harness change.
+  const { tools: mcpTools } = await client.listTools();
+  const tools: Anthropic.Tool[] = mcpTools.map((t) => ({
+    name: t.name,
+    description: t.description ?? '',
+    input_schema: t.inputSchema as Anthropic.Tool['input_schema'],
+  }));
 
   // 4. Actor loop — Claude runs FREE as the character ---------------------
   const budget = Math.min(MAX_ITERATIONS, Math.max(1, quota.remaining));
@@ -140,7 +124,7 @@ export async function runPersonaSession(
       model: MODEL,
       max_tokens: 1024,
       system: persona.systemPrompt,
-      tools: TOOLS,
+      tools,
       messages,
     });
     messages.push({ role: 'assistant', content: resp.content });
