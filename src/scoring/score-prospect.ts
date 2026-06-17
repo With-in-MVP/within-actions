@@ -82,7 +82,8 @@ Return ONLY a JSON object:
     });
 
     const text = response.content[0].type === 'text' ? response.content[0].text : '';
-    const parsed = JSON.parse(text);
+    // Models may wrap JSON in markdown fences — extract the object before parsing.
+    const parsed = JSON.parse(text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1));
     const icpScore = Math.max(0, Math.min(100, parsed.score));
 
     return {

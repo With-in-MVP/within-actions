@@ -37,7 +37,8 @@ Return ONLY the JSON object, no other text.`,
     });
 
     const text = response.content[0].type === 'text' ? response.content[0].text : '';
-    const parsed = JSON.parse(text);
+    // Models may wrap JSON in markdown fences — extract the object before parsing.
+    const parsed = JSON.parse(text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1));
 
     if (parsed.unknown) return null;
 
