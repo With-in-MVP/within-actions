@@ -6,10 +6,14 @@
   "scripts": {
     "dev": "tsx src/server.ts",
     "build": "tsc",
-    "start": "node dist/server.js"
+    "start": "node dist/server.js",
+    "simulate": "tsx --env-file=.env src/scripts/simulate-prospects.ts",
+    "persona:probe": "tsx --env-file=.env src/personas/probe.ts",
+    "persona:run": "tsx --env-file=.env src/personas/run.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.90.0",
+    "@modelcontextprotocol/sdk": "^1.12.0",
     "@supabase/supabase-js": "^2.103.0",
     "express": "^5.2.1",
     "zod": "^4.3.6"
