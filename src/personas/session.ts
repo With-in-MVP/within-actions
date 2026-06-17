@@ -14,12 +14,15 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { createUser, ropgLogin, deleteUser } from './auth.js';
 import type { GeneratedPersona } from './author.js';
+import { judgeConversion, PLAN_TO_INT } from './judge.js';
 
 const MODEL = process.env.PERSONA_MODEL ?? 'claude-haiku-4-5';
 const VENDOR_ID = process.env.VENDOR_ID ?? 'test-vendor-real-estate';
 const MAX_ITERATIONS = 20; // cost guardrail only — emergent behavior usually stops sooner
 const TIER_QUOTA: Record<number, number> = { 0: 0, 1: 10, 2: 50, 3: 200, 4: 500 };
-const BLOCKED = /trial has ended|requires a higher plan tier|used all free/i;
+// Quota exhaustion is terminal (nothing more will work). Scope denials are NOT —
+// they're fed back so the actor can react and reach for a tool it IS allowed to use.
+const QUOTA_EXHAUSTED = /trial has ended|used all free/i;
 
 export interface SessionSummary {
   domain: string;
@@ -31,6 +34,9 @@ export interface SessionSummary {
   iterations: number;
   stoppedBy: 'disengaged' | 'quota' | 'iteration_cap';
   outcomes: Record<string, number>;
+  pConvert: number;
+  converted: boolean;
+  plan: number;
 }
 
 // Reads tier+quota from the LEDGER — the source of truth. The token's tier can be
@@ -117,6 +123,7 @@ export async function runPersonaSession(
   let iterations = 0;
   let toolCalls = 0;
   let stoppedBy: SessionSummary['stoppedBy'] = 'disengaged';
+  const transcript: string[] = []; // what the persona did + the messages it saw (for the judge)
 
   while (iterations < budget) {
     iterations++;
@@ -136,18 +143,21 @@ export async function runPersonaSession(
     }
 
     const toolResults: Anthropic.ToolResultBlockParam[] = [];
-    let blocked = false;
+    let quotaExhausted = false;
     for (const tu of toolUses) {
       const result = await client.callTool({ name: tu.name, arguments: tu.input as Record<string, unknown> });
       toolCalls++;
       const text = extractText(result.content);
       console.log(`  [${tag}] call ${toolCalls}: ${tu.name}(${JSON.stringify(tu.input)})`);
-      if (BLOCKED.test(text)) blocked = true;
+      transcript.push(`${tu.name}(${JSON.stringify(tu.input)}) → ${text.replace(/\s+/g, ' ').slice(0, 180)}`);
+      if (QUOTA_EXHAUSTED.test(text)) quotaExhausted = true;
       toolResults.push({ type: 'tool_result', tool_use_id: tu.id, content: text });
     }
     messages.push({ role: 'user', content: toolResults });
 
-    if (blocked || toolCalls >= quota.remaining) {
+    // Only quota exhaustion ends the session. A scope denial just flows back to the
+    // actor, which adapts on its next turn (tries an allowed tool, or disengages).
+    if (quotaExhausted || toolCalls >= quota.remaining) {
       stoppedBy = 'quota';
       break;
     }
@@ -168,7 +178,24 @@ export async function runPersonaSession(
   const outcomes: Record<string, number> = {};
   for (const e of events ?? []) outcomes[e.outcome] = (outcomes[e.outcome] ?? 0) + 1;
 
-  // 6. Cleanup ------------------------------------------------------------
+  // 6. Conversion label — judge P(convert), Bernoulli draw, write the label ----
+  const transcriptStr = transcript.length ? transcript.join('\n') : '(made no tool calls — disengaged immediately)';
+  const judgment = await judgeConversion(persona.brief, transcriptStr);
+  const converted = Math.random() < judgment.pConvert;
+  const plan = converted ? Math.max(1, PLAN_TO_INT[judgment.plan] ?? 1) : 0;
+  const nowIso = new Date().toISOString();
+  await supabase.from('conversions').upsert(
+    { vendor_id: VENDOR_ID, email, converted, plan, converted_at: converted ? nowIso : null },
+    { onConflict: 'vendor_id,email' },
+  );
+  // Retain latent ground truth (intent + fit) for live validation — mirrors sim_ground_truth.
+  await supabase.from('sim_ground_truth').upsert(
+    { vendor_id: VENDOR_ID, email, archetype: 'persona-live', latent_intent: persona.latentIntent, latent_fit: tier / 4 },
+    { onConflict: 'vendor_id,email' },
+  );
+  console.log(`  [${tag}] conversion: p=${judgment.pConvert.toFixed(2)} → ${converted ? `CONVERTED (plan ${plan})` : 'no'}`);
+
+  // 7. Cleanup ------------------------------------------------------------
   if (!opts.keep) {
     try {
       await deleteUser(userId, mgmtToken);
@@ -187,5 +214,8 @@ export async function runPersonaSession(
     iterations,
     stoppedBy,
     outcomes,
+    pConvert: judgment.pConvert,
+    converted,
+    plan,
   };
 }

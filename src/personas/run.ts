@@ -50,15 +50,17 @@ async function main() {
 
   // Report — sorted by latent intent so the fit/intent relationship is legible ---
   console.log('=== SESSION SUMMARY (sorted by latent intent) ===');
-  console.log('domain                 latentIntent  tier  quota  calls  stoppedBy');
+  console.log('domain                 latentIntent  tier  calls  pConv  converted');
   for (const s of [...summaries].sort((a, b) => a.latentIntent - b.latentIntent)) {
     console.log(
       `${s.domain.padEnd(22)} ${String(s.latentIntent).padEnd(13)} ${String(s.tier).padEnd(5)} ` +
-        `${String(s.quotaLimit).padEnd(6)} ${String(s.toolCalls).padEnd(6)} ${s.stoppedBy}`,
+        `${String(s.toolCalls).padEnd(6)} ${s.pConvert.toFixed(2).padEnd(6)} ${s.converted ? `yes (plan ${s.plan})` : 'no'}`,
     );
   }
   const totalEvents = summaries.reduce((n, s) => n + Object.values(s.outcomes).reduce((a, b) => a + b, 0), 0);
-  console.log(`\n${summaries.length} sessions, ${totalEvents} usage_events generated.`);
+  const conversions = summaries.filter((s) => s.converted).length;
+  const rate = summaries.length ? ((conversions / summaries.length) * 100).toFixed(0) : '0';
+  console.log(`\n${summaries.length} sessions, ${totalEvents} usage_events, ${conversions} conversions (${rate}%).`);
   if (keep) console.log('(--keep set: Auth0 users NOT deleted)');
 }
 
