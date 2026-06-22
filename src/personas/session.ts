@@ -73,21 +73,39 @@ function extractText(content: unknown): string {
     .join('\n');
 }
 
-export async function runPersonaSession(
+export interface VisitResult {
+  tier: number;
+  quotaLimit: number;
+  quotaRemaining: number;
+  toolCalls: number;
+  iterations: number;
+  stoppedBy: SessionSummary['stoppedBy'];
+  outcomes: Record<string, number>;
+  transcript: string[];
+  floored: boolean;
+}
+
+/**
+ * Run ONE visit for an ALREADY-AUTHENTICATED persona: read tier/quota, connect
+ * the MCP client, run the actor loop, summarize this visit's usage_events. This
+ * is the reusable behavior core — `runPersonaSession` (one-shot) and the cron
+ * scheduler (spawn + return) both build on it. It does NOT judge or delete; the
+ * caller owns lifecycle. Pass `opts.preamble` to frame a return visit, and
+ * `opts.since` (ISO) to count only events from this visit forward.
+ */
+export async function runVisit(
   persona: GeneratedPersona,
-  mgmtToken: string,
+  email: string,
+  accessToken: string,
+  tokenTier: number,
   supabase: SupabaseClient,
-  opts: { keep?: boolean } = {},
-): Promise<SessionSummary> {
+  opts: { preamble?: string; since?: string } = {},
+): Promise<VisitResult> {
   const mcpUrl = process.env.MCP_URL!;
   const anthropic = new Anthropic();
   const tag = persona.domain.split('.')[0];
 
-  // 1. Provision + authenticate -------------------------------------------
-  const { userId, email, password } = await createUser(persona.domain, mgmtToken);
-  const { accessToken, tier: tokenTier } = await ropgLogin(email, password);
-
-  // 2. Read tier+quota from the LEDGER (source of truth; token tier can be floored)
+  // Read tier+quota from the LEDGER (source of truth; token tier can be floored)
   const quota = await readLedger(supabase, email, tokenTier);
   const tier = quota.tier;
   const floored = tokenTier !== quota.tier;
@@ -97,7 +115,7 @@ export async function runPersonaSession(
   );
   console.log(`  [${tag}] quota ${quota.remaining}/${quota.limit}`);
 
-  // 3. MCP client (bearer + per-domain User-Agent → agent_client_name) -----
+  // MCP client (bearer + per-domain User-Agent → agent_client_name) --------
   const transport = new StreamableHTTPClientTransport(new URL(mcpUrl), {
     requestInit: {
       headers: { authorization: `Bearer ${accessToken}`, 'user-agent': `persona-${tag}` },
@@ -115,11 +133,11 @@ export async function runPersonaSession(
     input_schema: t.inputSchema as Anthropic.Tool['input_schema'],
   }));
 
-  // 4. Actor loop — Claude runs FREE as the character ---------------------
+  // Actor loop — Claude runs FREE as the character ------------------------
   const budget = Math.min(MAX_ITERATIONS, Math.max(1, quota.remaining));
-  const messages: Anthropic.MessageParam[] = [
-    { role: 'user', content: 'You have just opened the property-data tool. Do whatever you would naturally do.' },
-  ];
+  const opener =
+    opts.preamble ?? 'You have just opened the property-data tool. Do whatever you would naturally do.';
+  const messages: Anthropic.MessageParam[] = [{ role: 'user', content: opener }];
   let iterations = 0;
   let toolCalls = 0;
   let stoppedBy: SessionSummary['stoppedBy'] = 'disengaged';
@@ -168,18 +186,57 @@ export async function runPersonaSession(
 
   await client.close();
 
-  // 5. Summarize the usage_events this persona produced -------------------
+  // Summarize the usage_events from THIS visit (filtered by `since` when given) --
   await new Promise((r) => setTimeout(r, 1200));
-  const { data: events } = await supabase
+  let q = supabase
     .from('usage_events')
     .select('outcome')
     .eq('vendor_id', VENDOR_ID)
     .eq('email', email);
+  if (opts.since) q = q.gte('created_at', opts.since);
+  const { data: events } = await q;
   const outcomes: Record<string, number> = {};
   for (const e of events ?? []) outcomes[e.outcome] = (outcomes[e.outcome] ?? 0) + 1;
 
-  // 6. Conversion label — judge P(convert), Bernoulli draw, write the label ----
-  const transcriptStr = transcript.length ? transcript.join('\n') : '(made no tool calls — disengaged immediately)';
+  return {
+    tier,
+    quotaLimit: quota.limit,
+    quotaRemaining: quota.remaining,
+    toolCalls,
+    iterations,
+    stoppedBy,
+    outcomes,
+    transcript,
+    floored,
+  };
+}
+
+/**
+ * One-shot persona session: provision a fresh Auth0 user, run a single visit,
+ * judge the (single-session) journey into a conversion label, and delete the
+ * user. This is the Phase B flow used by run.ts / probe — unchanged in behavior;
+ * it now delegates the visit to runVisit(). Cron does NOT use this (it owns the
+ * provision/judge/delete lifecycle across many ticks via runVisit directly).
+ */
+export async function runPersonaSession(
+  persona: GeneratedPersona,
+  mgmtToken: string,
+  supabase: SupabaseClient,
+  opts: { keep?: boolean } = {},
+): Promise<SessionSummary> {
+  const tag = persona.domain.split('.')[0];
+
+  // 1. Provision + authenticate -------------------------------------------
+  const { userId, email, password } = await createUser(persona.domain, mgmtToken);
+  const { accessToken, tier: tokenTier } = await ropgLogin(email, password);
+
+  // 2. Run the visit (tier/quota read + actor loop + per-visit event summary) ---
+  const visit = await runVisit(persona, email, accessToken, tokenTier, supabase);
+
+  // 3. Conversion label — judge P(convert), Bernoulli draw, write the label ----
+  const transcriptStr = visit.transcript.length
+    ? visit.transcript.join('\n')
+    : '(made no tool calls — disengaged immediately)';
   const judgment = await judgeConversion(persona.brief, transcriptStr);
   const converted = Math.random() < judgment.pConvert;
   const plan = converted ? Math.max(1, PLAN_TO_INT[judgment.plan] ?? 1) : 0;
@@ -190,12 +247,12 @@ export async function runPersonaSession(
   );
   // Retain latent ground truth (intent + fit) for live validation — mirrors sim_ground_truth.
   await supabase.from('sim_ground_truth').upsert(
-    { vendor_id: VENDOR_ID, email, archetype: 'persona-live', latent_intent: persona.latentIntent, latent_fit: tier / 4 },
+    { vendor_id: VENDOR_ID, email, archetype: 'persona-live', latent_intent: persona.latentIntent, latent_fit: visit.tier / 4 },
     { onConflict: 'vendor_id,email' },
   );
   console.log(`  [${tag}] conversion: p=${judgment.pConvert.toFixed(2)} → ${converted ? `CONVERTED (plan ${plan})` : 'no'}`);
 
-  // 7. Cleanup ------------------------------------------------------------
+  // 4. Cleanup ------------------------------------------------------------
   if (!opts.keep) {
     try {
       await deleteUser(userId, mgmtToken);
@@ -208,12 +265,12 @@ export async function runPersonaSession(
     domain: persona.domain,
     latentIntent: persona.latentIntent,
     email,
-    tier,
-    quotaLimit: quota.limit,
-    toolCalls,
-    iterations,
-    stoppedBy,
-    outcomes,
+    tier: visit.tier,
+    quotaLimit: visit.quotaLimit,
+    toolCalls: visit.toolCalls,
+    iterations: visit.iterations,
+    stoppedBy: visit.stoppedBy,
+    outcomes: visit.outcomes,
     pConvert: judgment.pConvert,
     converted,
     plan,
